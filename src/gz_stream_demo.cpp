@@ -1,4 +1,6 @@
 // Streams a gzip-compressed NDJSON file through simdjson in bounded chunks.
+// Multi-frame zstd and lz4 files (see make_data) are recognized by their
+// first bytes and are decompressed and parsed in parallel.
 //
 //   gz_stream_demo data.ndjson.gz [chunk_bytes]
 //   gz_stream_demo - < data.ndjson.gz                 (gzip on stdin)
@@ -6,6 +8,7 @@
 //   gz_stream_demo --decompress-only data.ndjson.gz   (baseline: zlib alone, no parsing)
 //   gz_stream_demo --threads 16 data.ndjson.gz        (parse with 16 threads)
 //   gz_stream_demo --raw --threads 16 data.ndjson     (uncompressed file, 16 threads)
+//   gz_stream_demo --threads 16 data.ndjson.zst       (zstd or lz4 frames, 16 threads)
 //
 // Memory use is bounded by the chunk size (the buffer only grows if a single
 // line is longer than it) times a small multiple of the number of threads,
@@ -13,6 +16,7 @@
 
 #include "gzip_reader.h"
 #include "ndjson_stream.h"
+#include "parallel_frames.h"
 #include "parallel_ndjson.h"
 #include "records.h"
 
@@ -49,6 +53,16 @@ int main(int argc, char **argv) {
   if (chunk == 0) { chunk = threads > 0 && raw && !from_stdin ? 1 << 16 : 1 << 20; }
   FILE *in = from_stdin ? stdin : std::fopen(path, "rb");
   if (!in) { std::perror(path); return EXIT_FAILURE; }
+  // zstd or lz4 frames? (A file only: we need to look at the first bytes.)
+  bool frames = false;
+  if (!from_stdin && !raw) {
+    unsigned char magic[4] = {0, 0, 0, 0};
+    size_t got = std::fread(magic, 1, 4, in);
+    uint32_t m = uint32_t(magic[0]) | uint32_t(magic[1]) << 8 | uint32_t(magic[2]) << 16 | uint32_t(magic[3]) << 24;
+    frames = got == 4 && (m == frames_detail::zstd_magic || m == frames_detail::lz4_magic);
+    std::rewind(in);
+    if (frames && threads == 0) { threads = 1; }
+  }
 
   query_result result;
   auto on_document = [&](simdjson::ondemand::document_reference doc) { accumulate(doc, result); };
@@ -60,6 +74,13 @@ int main(int argc, char **argv) {
   auto start = std::chrono::steady_clock::now();
   ndjson_stream_stats stats;
   try {
+    if (decompress_only && frames) {
+      stats.bytes = for_each_frame(path, [](size_t, const char *, size_t, bool) {}, threads, &stats.chunks);
+      double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+      std::printf("decompress only (%zu threads): %.1f MB decompressed, %zu frames, %.2f s (%.0f MB/s)\n", threads,
+                  stats.bytes / 1e6, stats.chunks, secs, stats.bytes / 1e6 / secs);
+      return EXIT_SUCCESS;
+    }
     if (decompress_only) {
       gzip_reader reader(in);
       std::unique_ptr<char[]> buf(new char[chunk]);
@@ -70,7 +91,10 @@ int main(int argc, char **argv) {
                   stats.bytes / 1e6 / secs);
       return EXIT_SUCCESS;
     }
-    if (threads > 0 && raw && !from_stdin) {
+    if (frames) {
+      // Each thread decompresses and parses whole frames.
+      stats = for_each_ndjson_document_in_frames(path, on_document_mt, threads);
+    } else if (threads > 0 && raw && !from_stdin) {
       // A regular file: each thread reads (pread) and parses slices of it.
       stats = for_each_ndjson_document_in_file(path, on_document_mt, threads, chunk);
     } else if (threads > 0 && raw) {

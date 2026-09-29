@@ -135,13 +135,46 @@ up at the end:
 ./build/gz_stream_demo --threads 2 data.ndjson.gz       # 1 thread inflates, 2 parse
 ```
 
+## zstd and lz4 in many frames: parallel decompression
+
+A gzip stream must be decompressed from start to end, so a gzip file can
+use at most one decompressing thread. zstd and lz4 files may instead be
+made of many independent *frames*, one after the other. The file is still an
+ordinary `.zst` or `.lz4` file: `zstd -d` and `lz4 -d` decompress it
+as usual. `make_data` writes such files (`src/frame_writer.h`):
+
+- each frame holds about 256 KiB of whole lines, so it ends with a newline;
+- each frame records its decompressed size and a checksum of its content
+  (like gzip's CRC-32).
+
+`for_each_ndjson_document_in_frames(path, callback, threads)` in
+`src/parallel_frames.h` maps the compressed file in memory. The threads take
+the frames one at a time. Finding where the next frame ends only requires
+reading block headers (`ZSTD_findFrameCompressedSize`, or a short walk over
+the lz4 block headers), not decompressing. Each thread decompresses a frame
+into its own buffer and parses it with its own parser. The reader checks
+that every frame but the last ends with a newline. It skips skippable frames,
+accepts zstd and lz4 frames in the same file, and reports corrupted or
+truncated input with an exception. `src/frames_test.cpp` tests all of this
+(every frame size from one line per frame to a single frame, 1, 3 and 8
+threads, and bad input).
+
+```sh
+./build/make_data data.ndjson.zst 5000000       # zstd, 256 KiB frames (optional 3rd arg: frame size)
+./build/make_data data.ndjson.lz4 5000000       # lz4, 256 KiB frames
+./build/gz_stream_demo --threads 64 data.ndjson.zst                    # format detected from the file
+./build/gz_stream_demo --decompress-only --threads 64 data.ndjson.lz4  # decompression alone
+```
+
 ## Build and run
 
-Requires CMake and zlib. simdjson v5.0.1 is fetched automatically.
+Requires CMake and zlib. simdjson v5.0.1, zstd v1.5.7 and lz4 v1.10.0 are
+fetched and built automatically.
 
 ```sh
 cmake -B build && cmake --build build
 ./build/boundary_test                       # exhaustive chunk-boundary tests
+./build/frames_test                         # multi-frame zstd and lz4 tests
 ./build/make_data data.ndjson.gz 5000000    # 812 MB of NDJSON, 57 MB gzipped
 ./build/gz_stream_demo data.ndjson.gz       # optional 2nd arg: chunk size in bytes (default 1 MiB)
 ./build/gz_stream_demo - < data.ndjson.gz   # gzip on stdin
@@ -158,33 +191,58 @@ active records whose `user.tags` contains `"admin"`.
 
 Run `./bench.sh` after building. It generates the data if needed, runs each
 configuration 5 times, and reports the median throughput in MB/s of
-*decompressed* NDJSON. The data is 5,000,000 records: 812 MB of NDJSON,
-57 MB gzipped (a 14:1 ratio).
+*decompressed* NDJSON. The data is 5,000,000 records: 812 MB of NDJSON.
+
+| file | size | ratio |
+|---|---:|---:|
+| `data.ndjson` | 812.0 MB | 1 |
+| `data.ndjson.gz` (gzip level 6, one stream) | 56.9 MB | 14.3 |
+| `data.ndjson.zst` (zstd level 3, 256 KiB frames) | 60.6 MB | 13.4 |
+| `data.ndjson.lz4` (lz4 default level, 256 KiB frames) | 108.5 MB | 7.5 |
 
 Machine: big4, Intel Xeon Gold 6548N (Emerald Rapids, up to 4.1 GHz),
-Linux 6.12 (RHEL 10), GCC 14.3, zlib-ng-compat 2.2.3, simdjson 5.0.1.
+Linux 6.12 (RHEL 10), GCC 14.3, zlib-ng-compat 2.2.3, simdjson 5.0.1,
+zstd 1.5.7, lz4 1.10.0.
 
 | configuration | MB/s |
 |---|---:|
-| zlib decompression only (no parsing) | 2361 |
-| gzip file, chunk 64 KiB | 1169 |
-| gzip file, chunk 256 KiB | 1224 |
-| gzip file, chunk 1024 KiB | 1147 |
-| gzip file, chunk 4096 KiB | 1131 |
-| gzip file, chunk 16384 KiB | 1145 |
-| uncompressed file, chunk 1024 KiB (parse only) | 1896 |
-| uncompressed file, 1 thread, chunk 64 KiB | 1757 |
-| uncompressed file, 2 threads, chunk 64 KiB | 3435 |
-| uncompressed file, 4 threads, chunk 64 KiB | 6801 |
-| uncompressed file, 8 threads, chunk 64 KiB | 13347 |
-| uncompressed file, 16 threads, chunk 64 KiB | 24239 |
-| uncompressed file, 32 threads, chunk 64 KiB | 38933 |
-| uncompressed file, 64 threads, chunk 64 KiB | 48523 |
-| gzip file, 1 inflating + 1 parsing thread, chunk 256 KiB | 2299 |
-| gzip file, 1 inflating + 2 parsing threads, chunk 256 KiB | 2470 |
-| gzip file, 1 inflating + 4 parsing threads, chunk 256 KiB | 2469 |
-| `gzip -dc \| demo --raw` (2 processes) | 292 |
-| `pigz -dc \| demo --raw` (2+ processes) | 790 |
+| zlib decompression only (no parsing) | 2346 |
+| gzip file, chunk 64 KiB | 1182 |
+| gzip file, chunk 256 KiB | 1230 |
+| gzip file, chunk 1024 KiB | 1151 |
+| gzip file, chunk 4096 KiB | 1132 |
+| gzip file, chunk 16384 KiB | 1137 |
+| uncompressed file, chunk 1024 KiB (parse only) | 1776 |
+| uncompressed file, 1 thread, chunk 64 KiB | 1759 |
+| uncompressed file, 2 threads, chunk 64 KiB | 3437 |
+| uncompressed file, 4 threads, chunk 64 KiB | 6803 |
+| uncompressed file, 8 threads, chunk 64 KiB | 13375 |
+| uncompressed file, 16 threads, chunk 64 KiB | 24518 |
+| uncompressed file, 32 threads, chunk 64 KiB | 41359 |
+| uncompressed file, 64 threads, chunk 64 KiB | 51783 |
+| gzip file, 1 inflating + 1 parsing thread, chunk 256 KiB | 2261 |
+| gzip file, 1 inflating + 2 parsing threads, chunk 256 KiB | 2440 |
+| gzip file, 1 inflating + 4 parsing threads, chunk 256 KiB | 2439 |
+| zstd frames, decompression only, 1 thread | 2162 |
+| zstd frames, decompression only, 64 threads | 47597 |
+| zstd frames, 1 thread | 1136 |
+| zstd frames, 2 threads | 2264 |
+| zstd frames, 4 threads | 4468 |
+| zstd frames, 8 threads | 8703 |
+| zstd frames, 16 threads | 16579 |
+| zstd frames, 32 threads | 28775 |
+| zstd frames, 64 threads | 39613 |
+| lz4 frames, decompression only, 1 thread | 2151 |
+| lz4 frames, decompression only, 64 threads | 40434 |
+| lz4 frames, 1 thread | 1138 |
+| lz4 frames, 2 threads | 2246 |
+| lz4 frames, 4 threads | 4434 |
+| lz4 frames, 8 threads | 8573 |
+| lz4 frames, 16 threads | 16040 |
+| lz4 frames, 32 threads | 26545 |
+| lz4 frames, 64 threads | 34372 |
+| `gzip -dc \| demo --raw` (2 processes) | 291 |
+| `pigz -dc \| demo --raw` (2+ processes) | 787 |
 
 What the numbers show:
 
@@ -193,7 +251,7 @@ What the numbers show:
   decompression (2.4 GB/s) and parsing (1.8 GB/s) one after the other, so
   chunking adds essentially no overhead.
 - **Parsing an uncompressed file scales with threads:** 1.9 GB/s on one
-  thread, 13 GB/s on 8, and 48 GB/s on 64 (25x). At that speed the whole
+  thread, 13 GB/s on 8, and 52 GB/s on 64 (29x). At that speed the whole
   812 MB file takes about 17 ms, so thread startup is a noticeable part of
   the time, and a larger file would scale even better. Small slices
   (64 KiB) are best: the buffer stays in L2 and the load stays balanced.
@@ -202,6 +260,22 @@ What the numbers show:
   That is as fast as zlib can decompress in a single thread. Since
   a gzip stream can only be inflated sequentially, one parsing thread is
   almost enough.
+- **zstd or lz4 frames scale with threads, gzip cannot.** Each thread
+  decompresses and parses at about 1.1 GB/s, the same as a single gzip
+  thread. But 64 threads reach 40 GB/s with zstd and 34 GB/s with lz4,
+  16x the best gzip result (2.4 GB/s). zstd frames cost only 6% more space
+  than a single gzip stream (60.6 MB vs 56.9 MB).
+- **Frame size is a trade-off.** Smaller frames balance the load better:
+  with 1 MiB frames, 64 threads reach only 27 GB/s (zstd) and 33 GB/s (lz4).
+  With 128 KiB frames the files grow a little (zstd: 61.6 MB) for no gain
+  over 256 KiB.
+- **lz4 is not faster than zstd here**, and its file is 1.8x larger. Its
+  content checksum (xxHash32) is the bottleneck: without it, lz4 decompresses
+  at 4.5 GB/s in one thread instead of 2.1 GB/s. We keep the checksum, as
+  for gzip and zstd. We also give the lz4 decoder room for a whole block past
+  the end of the content. Without that room, it decodes the last block of each
+  frame into an internal buffer and copies it out, which cost about a third
+  of the speed at 64 threads (22 GB/s instead of 32 GB/s, with 1 MiB frames).
 - **Chunk size barely matters** in a single thread. 64 KiB–256 KiB is as fast as larger chunks,
   because it keeps the working set in cache.
 - **Decompressing in-process is 1.5–4x faster than piping.** The `gzip`
