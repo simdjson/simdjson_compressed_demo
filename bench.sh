@@ -19,6 +19,14 @@ for c in 65536 262144 1048576 4194304 16777216; do
   run "gzip file, chunk $((c / 1024)) KiB"   "$B/gz_stream_demo data.ndjson.gz $c"
 done
 run "uncompressed file, chunk 1024 KiB (parse only)" "$B/gz_stream_demo --raw data.ndjson 1048576"
+T=$(nproc)
+for t in 1 2 4 8 16 32 64; do
+  [ "$t" -le "$T" ] || break
+  run "uncompressed file, threads=$t, chunk 64 KiB" "$B/gz_stream_demo --raw --threads $t data.ndjson 65536"
+done
+for t in 1 2 4; do
+  run "gzip file, threads=$t (+1 inflating), chunk 256 KiB" "$B/gz_stream_demo --threads $t data.ndjson.gz 262144"
+done
 run "gzip -dc | demo --raw (2 processes)"     "gzip -dc data.ndjson.gz | $B/gz_stream_demo --raw - 1048576"
 if command -v pigz >/dev/null; then
   run "pigz -dc | demo --raw (2+ processes)"  "pigz -dc data.ndjson.gz | $B/gz_stream_demo --raw - 1048576"

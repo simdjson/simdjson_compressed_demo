@@ -107,6 +107,34 @@ void accumulate(simdjson::ondemand::document_reference doc, query_result &r) {
 }
 ```
 
+## Multithreading
+
+`src/parallel_ndjson.h` has two multithreaded versions. Each thread has its
+own parser and parses whole chunks, cut after a newline as above. So the
+callback is called concurrently and out of order. It gets the thread's index,
+so each thread can add to its own result, and the results are added
+up at the end:
+
+- **`for_each_ndjson_document_in_file(path, callback, threads, chunk)`** for
+  a regular file. Slice *k* of the file starts just after the first newline
+  at or after offset *k* × `chunk` − 1 and ends where slice *k*+1 starts.
+  Each thread can find these bounds without talking to the others, and the
+  slices cover the file exactly, even when a line is longer than a slice.
+  The threads take slices from an atomic counter, read each one with
+  `pread()` into their own padded buffer, and parse it.
+  We tried `mmap()` first, and it was slower: unmapping an 812 MB file took
+  18 ms, about half of the total time at 64 threads.
+  Copying a 64 KiB slice into a buffer that stays in L2 costs little.
+- **`for_each_ndjson_document_parallel(reader, callback, threads, chunk)`**
+  for any reader (gzip, a pipe). The calling thread reads or decompresses
+  chunks and puts them in a queue. The parsing threads take them from the
+  queue. Memory is bounded: (2 × `threads` + 2) chunk buffers.
+
+```sh
+./build/gz_stream_demo --raw --threads 64 data.ndjson   # 64 threads, 64 KiB slices
+./build/gz_stream_demo --threads 2 data.ndjson.gz       # 1 thread inflates, 2 parse
+```
+
 ## Build and run
 
 Requires CMake and zlib. simdjson v5.0.1 is fetched automatically.
@@ -138,14 +166,24 @@ Linux 6.12 (RHEL 10), GCC 14.3, zlib-ng-compat 2.2.3, simdjson 5.0.1.
 
 | configuration | MB/s |
 |---|---:|
-| zlib decompression only (no parsing) | 2366 |
-| gzip file, chunk 64 KiB | 1159 |
-| gzip file, chunk 256 KiB | 1211 |
-| gzip file, chunk 1024 KiB | 1126 |
-| gzip file, chunk 4096 KiB | 1119 |
-| gzip file, chunk 16384 KiB | 1125 |
-| uncompressed file, chunk 1024 KiB (parse only) | 1830 |
-| `gzip -dc \| demo --raw` (2 processes) | 293 |
+| zlib decompression only (no parsing) | 2361 |
+| gzip file, chunk 64 KiB | 1169 |
+| gzip file, chunk 256 KiB | 1224 |
+| gzip file, chunk 1024 KiB | 1147 |
+| gzip file, chunk 4096 KiB | 1131 |
+| gzip file, chunk 16384 KiB | 1145 |
+| uncompressed file, chunk 1024 KiB (parse only) | 1896 |
+| uncompressed file, 1 thread, chunk 64 KiB | 1757 |
+| uncompressed file, 2 threads, chunk 64 KiB | 3435 |
+| uncompressed file, 4 threads, chunk 64 KiB | 6801 |
+| uncompressed file, 8 threads, chunk 64 KiB | 13347 |
+| uncompressed file, 16 threads, chunk 64 KiB | 24239 |
+| uncompressed file, 32 threads, chunk 64 KiB | 38933 |
+| uncompressed file, 64 threads, chunk 64 KiB | 48523 |
+| gzip file, 1 inflating + 1 parsing thread, chunk 256 KiB | 2299 |
+| gzip file, 1 inflating + 2 parsing threads, chunk 256 KiB | 2470 |
+| gzip file, 1 inflating + 4 parsing threads, chunk 256 KiB | 2469 |
+| `gzip -dc \| demo --raw` (2 processes) | 292 |
 | `pigz -dc \| demo --raw` (2+ processes) | 790 |
 
 What the numbers show:
@@ -154,7 +192,17 @@ What the numbers show:
   with only a 64 KiB–16 MiB buffer. That is about what you get from running
   decompression (2.4 GB/s) and parsing (1.8 GB/s) one after the other, so
   chunking adds essentially no overhead.
-- **Chunk size barely matters.** 64 KiB–256 KiB is as fast as larger chunks,
+- **Parsing an uncompressed file scales with threads:** 1.9 GB/s on one
+  thread, 13 GB/s on 8, and 48 GB/s on 64 (25x). At that speed the whole
+  812 MB file takes about 17 ms, so thread startup is a noticeable part of
+  the time, and a larger file would scale even better. Small slices
+  (64 KiB) are best: the buffer stays in L2 and the load stays balanced.
+  With 1 MiB slices, 64 threads only reach 25 GB/s.
+- **With gzip, parsing in other threads doubles the speed** to 2.5 GB/s.
+  That is as fast as zlib can decompress in a single thread. Since
+  a gzip stream can only be inflated sequentially, one parsing thread is
+  almost enough.
+- **Chunk size barely matters** in a single thread. 64 KiB–256 KiB is as fast as larger chunks,
   because it keeps the working set in cache.
 - **Decompressing in-process is 1.5–4x faster than piping.** The `gzip`
   command-line tool (classic zlib) caps a `gzip -dc |` pipeline at about

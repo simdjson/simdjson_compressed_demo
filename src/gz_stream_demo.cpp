@@ -4,18 +4,23 @@
 //   gz_stream_demo - < data.ndjson.gz                 (gzip on stdin)
 //   zcat data.ndjson.gz | gz_stream_demo --raw -      (already decompressed stdin)
 //   gz_stream_demo --decompress-only data.ndjson.gz   (baseline: zlib alone, no parsing)
+//   gz_stream_demo --threads 16 data.ndjson.gz        (parse with 16 threads)
+//   gz_stream_demo --raw --threads 16 data.ndjson     (uncompressed file, 16 threads)
 //
 // Memory use is bounded by the chunk size (the buffer only grows if a single
-// line is longer than it), independently of the input size.
+// line is longer than it) times a small multiple of the number of threads,
+// independently of the input size.
 
 #include "gzip_reader.h"
 #include "ndjson_stream.h"
+#include "parallel_ndjson.h"
 #include "records.h"
 
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 // For input that is already decompressed (e.g., `zcat file.gz | demo --raw -`).
 struct raw_reader {
@@ -27,22 +32,31 @@ int main(int argc, char **argv) {
   bool raw = false;
   bool decompress_only = false;
   const char *path = nullptr;
-  size_t chunk = 1 << 20;
+  size_t chunk = 0;   // 0: default (64 KiB for a file read by several threads, 1 MiB otherwise)
+  size_t threads = 0; // 0: the single-threaded code in ndjson_stream.h
   for (int i = 1; i < argc; i++) {
     if (std::strcmp(argv[i], "--raw") == 0) { raw = true; }
+    else if (std::strcmp(argv[i], "--threads") == 0 && i + 1 < argc) { threads = std::strtoull(argv[++i], nullptr, 10); }
     else if (std::strcmp(argv[i], "--decompress-only") == 0) { decompress_only = true; }
     else if (!path) { path = argv[i]; }
     else { chunk = std::strtoull(argv[i], nullptr, 10); }
   }
   if (!path) {
-    std::fprintf(stderr, "usage: %s [--raw|--decompress-only] file.ndjson.gz|- [chunk_bytes]\n", argv[0]);
+    std::fprintf(stderr, "usage: %s [--raw|--decompress-only] [--threads N] file.ndjson.gz|- [chunk_bytes]\n", argv[0]);
     return EXIT_FAILURE;
   }
-  FILE *in = std::strcmp(path, "-") == 0 ? stdin : std::fopen(path, "rb");
+  const bool from_stdin = std::strcmp(path, "-") == 0;
+  if (chunk == 0) { chunk = threads > 0 && raw && !from_stdin ? 1 << 16 : 1 << 20; }
+  FILE *in = from_stdin ? stdin : std::fopen(path, "rb");
   if (!in) { std::perror(path); return EXIT_FAILURE; }
 
   query_result result;
   auto on_document = [&](simdjson::ondemand::document_reference doc) { accumulate(doc, result); };
+  // With threads, each thread accumulates into its own result (on its own
+  // cache line) and we add them up at the end.
+  struct alignas(64) padded_result { query_result r; };
+  std::vector<padded_result> results(threads);
+  auto on_document_mt = [&](size_t t, simdjson::ondemand::document_reference doc) { accumulate(doc, results[t].r); };
   auto start = std::chrono::steady_clock::now();
   ndjson_stream_stats stats;
   try {
@@ -56,7 +70,17 @@ int main(int argc, char **argv) {
                   stats.bytes / 1e6 / secs);
       return EXIT_SUCCESS;
     }
-    if (raw) {
+    if (threads > 0 && raw && !from_stdin) {
+      // A regular file: each thread reads (pread) and parses slices of it.
+      stats = for_each_ndjson_document_in_file(path, on_document_mt, threads, chunk);
+    } else if (threads > 0 && raw) {
+      raw_reader reader{in};
+      stats = for_each_ndjson_document_parallel(reader, on_document_mt, threads, chunk);
+    } else if (threads > 0) {
+      // This thread decompresses while the others parse.
+      gzip_reader reader(in);
+      stats = for_each_ndjson_document_parallel(reader, on_document_mt, threads, chunk);
+    } else if (raw) {
       raw_reader reader{in};
       stats = for_each_ndjson_document(reader, on_document, chunk);
     } else {
@@ -69,6 +93,11 @@ int main(int argc, char **argv) {
   }
   double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
   if (in != stdin) { std::fclose(in); }
+  for (auto &p : results) {
+    result.count += p.r.count;
+    result.active += p.r.active;
+    result.admin_score_sum += p.r.admin_score_sum;
+  }
 
   std::printf("count=%llu active=%llu admin_score_sum=%lld\n",
               (unsigned long long)result.count, (unsigned long long)result.active,
