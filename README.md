@@ -29,6 +29,84 @@ reader that has a `size_t read(char*, size_t)` method. `src/gzip_reader.h`
 is a small zlib wrapper that handles files, stdin and multi-member gzip
 (for example, output from `pigz`).
 
+## The simdjson code
+
+Here is a sketch of the main loop in `src/ndjson_stream.h`, without the error
+handling and statistics:
+
+```cpp
+simdjson::ondemand::parser parser;               // reused for every chunk
+std::unique_ptr<char[]> buf(new char[capacity + simdjson::SIMDJSON_PADDING]);
+size_t len = 0;                                  // carry-over sits at the front
+bool eof = false;
+
+while (true) {
+  // 1. Fill the buffer with decompressed bytes.
+  while (len < capacity && !eof) {
+    size_t n = reader.read(buf.get() + len, capacity - len);
+    eof = (n == 0);
+    len += n;
+  }
+  // 2. Cut after the last '\n' (or take everything at end of input).
+  size_t cut = eof ? len : last_newline(buf.get(), len) + 1;
+  //    (no newline at all: double the buffer and go back to step 1)
+
+  // 3. Parse the complete documents in [0, cut).
+  simdjson::ondemand::document_stream stream;
+  parser.iterate_many(buf.get(), cut, /*batch_size=*/cut).get(stream);
+  for (auto doc : stream) {
+    callback(doc.value_unsafe());                // one NDJSON line
+  }
+  if (eof) { break; }
+
+  // 4. Move the partial last line to the front.
+  std::memmove(buf.get(), buf.get() + cut, len - cut);
+  len -= cut;
+}
+```
+
+Things to know:
+
+- **Padding.** simdjson reads up to `SIMDJSON_PADDING` bytes past the end of
+  its input, so the buffer is allocated with that much extra space. Whatever
+  is in those bytes (here, the start of the carried-over line) is ignored.
+  Nothing is copied or zeroed.
+- **`batch_size = cut`.** Each chunk is indexed in one pass. The batch size
+  must be at least as large as the largest document, and a chunk always is.
+- **One parser for the whole stream.** Its memory is allocated once and then
+  reused for every chunk.
+- **`truncated_bytes()` is only a sanity check.** Since every chunk ends on a
+  newline, it must be 0 after the loop. If it isn't, the last line is not
+  valid JSON and the code reports an error.
+- **Lifetimes.** A `document_reference`, and any `std::string_view` you got
+  from it, is only valid until the stream moves to the next document. Copy
+  anything you need to keep.
+
+Each document is handled with On-Demand (`accumulate` in `src/records.h`).
+The code visits the fields once, in the order they appear, and parses only
+the values it needs:
+
+```cpp
+void accumulate(simdjson::ondemand::document_reference doc, query_result &r) {
+  bool active = false, admin = false;
+  int64_t score = 0;
+  for (auto field : doc.get_object()) {
+    std::string_view key = field.unescaped_key();
+    if (key == "active") {
+      active = field.value().get_bool();
+    } else if (key == "user") {
+      for (auto tag : field.value()["tags"].get_array()) {
+        if (std::string_view(tag.get_string()) == "admin") { admin = true; }
+      }
+    } else if (key == "score") {
+      score = field.value().get_int64();
+    }                                            // other fields ("note", ...) are skipped
+  }
+  r.count++;
+  if (active) { r.active++; if (admin) { r.admin_score_sum += score; } }
+}
+```
+
 ## Build and run
 
 Requires CMake and zlib. simdjson v5.0.1 is fetched automatically.
