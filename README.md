@@ -1,6 +1,6 @@
-# Streaming gzip-compressed NDJSON with simdjson
+# Streaming gcompressed NDJSON with simdjson
 
-This demo processes a gzip-compressed NDJSON (JSON Lines) file of any size with
+This demo processes a compressed NDJSON (JSON Lines) file of any size with
 bounded memory. It decompresses a chunk, parses the complete documents in that
 chunk with simdjson's `iterate_many`, and carries the partial last line over
 to the next chunk. It never decompresses the whole file in memory, and it
